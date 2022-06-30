@@ -9,6 +9,12 @@ from dask.highlevelgraph import HighLevelGraph
 from dask.layers import DataFrameIOLayer
 from dask.utils import M, apply, is_arraylike
 
+
+# try:
+#     from dask.blockwise import BlockBcast
+# except ImportError:
+#     BlockBcast = None
+
 logger = logging.getLogger(__name__)
 
 
@@ -178,11 +184,15 @@ _regenerable_ops = set(_comparison_symbols.keys()) | {
     operator.or_,
     operator.getitem,
     M.fillna,
+    M.isin,
 }
 
 # Specify functions that must be generated with
 # a different API at the dataframe-collection level
-_special_op_mappings = {M.fillna: dd._Frame.fillna}
+_special_op_mappings = {
+    M.fillna: dd._Frame.fillna,
+    M.isin: dd._Frame.isin,
+}
 
 
 class RegenerableLayer:
@@ -223,6 +233,10 @@ class RegenerableLayer:
                     continue
                 inputs.append(key)
             elif key in self.layer.io_deps:
+                #if BlockBcast and isinstance(self.layer.io_deps[key], BlockBcast):
+                #    inputs.append(next(iter(self.layer.io_deps[key])))
+                #else:
+                #    continue
                 continue
             else:
                 inputs.append(
@@ -254,6 +268,7 @@ class RegenerableLayer:
         graph terminating at this layer
         """
         op = self.creation_info["func"]
+        io_deps = {}
         if op in _comparison_symbols.keys():
             func = _blockwise_comparison_dnf
         elif op in (operator.and_, operator.or_):
@@ -262,10 +277,13 @@ class RegenerableLayer:
             func = _blockwise_getitem_dnf
         elif op == dd._Frame.fillna:
             func = _blockwise_fillna_dnf
+        elif op == dd._Frame.isin:
+            func = _blockwise_isin_dnf
+            io_deps = self.layer.io_deps
         else:
             raise ValueError(f"No DNF expression for {op}")
 
-        return func(op, self.layer.indices, dsk)
+        return func(op, self.layer.indices, dsk, io_deps)
 
 
 class RegenerableGraph:
@@ -325,19 +343,21 @@ class RegenerableGraph:
         return RegenerableGraph(_layers)
 
 
-def _get_blockwise_input(input_index, indices: list, dsk: RegenerableGraph):
+def _get_blockwise_input(input_index, indices: list, dsk: RegenerableGraph, io_deps: dict):
     # Simple utility to get the required input expressions
     # for a Blockwise layer (using indices)
     key = indices[input_index][0]
     if indices[input_index][1] is None:
         return key
+    # if key in io_deps and isinstance(io_deps[key], BlockBcast):
+    #     return next(iter(io_deps[key]))
     return dsk.layers[key]._dnf_filter_expression(dsk)
 
 
-def _blockwise_comparison_dnf(op, indices: list, dsk: RegenerableGraph):
+def _blockwise_comparison_dnf(op, indices: list, dsk: RegenerableGraph, io_deps: dict):
     # Return DNF expression pattern for a simple comparison
-    left = _get_blockwise_input(0, indices, dsk)
-    right = _get_blockwise_input(1, indices, dsk)
+    left = _get_blockwise_input(0, indices, dsk, io_deps)
+    right = _get_blockwise_input(1, indices, dsk, io_deps)
 
     def _inv(symbol: str):
         return {
@@ -356,10 +376,10 @@ def _blockwise_comparison_dnf(op, indices: list, dsk: RegenerableGraph):
     return to_dnf((left, _comparison_symbols[op], right))
 
 
-def _blockwise_logical_dnf(op, indices: list, dsk: RegenerableGraph):
+def _blockwise_logical_dnf(op, indices: list, dsk: RegenerableGraph, io_deps: dict):
     # Return DNF expression pattern for logical "and" or "or"
-    left = _get_blockwise_input(0, indices, dsk)
-    right = _get_blockwise_input(1, indices, dsk)
+    left = _get_blockwise_input(0, indices, dsk, io_deps)
+    right = _get_blockwise_input(1, indices, dsk, io_deps)
     if op == operator.or_:
         return to_dnf(Or([left, right]))
     elif op == operator.and_:
@@ -368,12 +388,22 @@ def _blockwise_logical_dnf(op, indices: list, dsk: RegenerableGraph):
         raise ValueError
 
 
-def _blockwise_getitem_dnf(op, indices: list, dsk: RegenerableGraph):
+def _blockwise_getitem_dnf(op, indices: list, dsk: RegenerableGraph, io_deps: dict):
     # Return dnf of key (selected by getitem)
-    key = _get_blockwise_input(1, indices, dsk)
+    key = _get_blockwise_input(1, indices, dsk, io_deps)
     return key
 
 
-def _blockwise_fillna_dnf(op, indices: list, dsk: RegenerableGraph):
+def _blockwise_fillna_dnf(op, indices: list, dsk: RegenerableGraph, io_deps: dict):
     # Return dnf of input collection
-    return _get_blockwise_input(0, indices, dsk)
+    return _get_blockwise_input(0, indices, dsk, io_deps)
+
+
+def _blockwise_isin_dnf(op, indices: list, dsk: RegenerableGraph, io_deps: dict):
+    # Return simple (<col>, 'in', <list>) dnf tuple
+
+    left = _get_blockwise_input(0, indices, dsk, io_deps)
+    right = _get_blockwise_input(1, indices, dsk, io_deps)
+    if isinstance(right, list):
+        right = tuple(right)
+    return to_dnf((left, "in", right))
